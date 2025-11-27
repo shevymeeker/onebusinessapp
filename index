@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Contractor Command Center</title>
+    <meta name="theme-color" content="#2563eb">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    
+    <link rel="manifest" href="manifest.json">
+    
+    <style>
+        body { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+        .tab-active { border-bottom: 2px solid #2563eb; color: #2563eb; font-weight: 600; }
+        .tab-inactive { color: #6b7280; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="bg-gray-50 text-slate-800 h-screen flex flex-col overflow-hidden">
+
+    <div id="app" class="flex-1 flex flex-col relative overflow-hidden">
+        </div>
+
+    <script>
+        // ==========================================
+        // 1. DATABASE LAYER (IndexedDB - Offline Only)
+        // ==========================================
+        const DB_NAME = 'ContractorCommand_V1';
+        const DB_VERSION = 1;
+        let db;
+
+        const initDB = () => {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+                
+                request.onerror = (e) => reject(e);
+                
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    
+                    // Projects Store
+                    if (!db.objectStoreNames.contains('projects')) {
+                        db.createObjectStore('projects', { keyPath: 'id' });
+                    }
+                    
+                    // Estimate Items Store
+                    if (!db.objectStoreNames.contains('estimateItems')) {
+                        const store = db.createObjectStore('estimateItems', { keyPath: 'id' });
+                        store.createIndex('projectId', 'projectId', { unique: false });
+                    }
+
+                    // Photos Store
+                    if (!db.objectStoreNames.contains('photos')) {
+                        const store = db.createObjectStore('photos', { keyPath: 'id' });
+                        store.createIndex('projectId', 'projectId', { unique: false });
+                    }
+                    
+                    // Library Store
+                    if (!db.objectStoreNames.contains('library')) {
+                        db.createObjectStore('library', { keyPath: 'id' });
+                    }
+                };
+
+                request.onsuccess = (e) => {
+                    db = e.target.result;
+                    resolve(db);
+                };
+            });
+        };
+
+        const dbOp = (storeName, mode, callback) => {
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(storeName, mode);
+                const store = tx.objectStore(storeName);
+                const req = callback(store);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        };
+
+        const getProjectItems = (projectId) => {
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('estimateItems', 'readonly');
+                const store = tx.objectStore('estimateItems');
+                const index = store.index('projectId');
+                const req = index.getAll(projectId);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        };
+
+        // ==========================================
+        // 2. STATE & UTILS
+        // ==========================================
+        const state = {
+            view: 'dashboard', 
+            activeProject: null,
+            activeTab: 'estimate', 
+            projects: [],
+            estimateItems: []
+        };
+
+        const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+        const currency = (num) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(num || 0);
+
+        // ==========================================
+        // 3. MANUAL BACKUP SYSTEM
+        // ==========================================
+        const exportProject = async () => {
+            if(!state.activeProject) return;
+            
+            try {
+                const zip = new JSZip();
+                
+                // 1. Add Project Info
+                zip.file("project_info.json", JSON.stringify(state.activeProject, null, 2));
+                
+                // 2. Add Estimate Data
+                const items = await getProjectItems(state.activeProject.id);
+                zip.file("estimate_data.json", JSON.stringify(items, null, 2));
+
+                // 3. Generate and Download
+                const content = await zip.generateAsync({type:"blob"});
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(content);
+                const safeName = state.activeProject.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+                a.download = `${safeName}_backup.zip`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+            } catch (err) {
+                alert("Backup failed: " + err.message);
+            }
+        };
+
+        // ==========================================
+        // 4. UI RENDERERS
+        // ==========================================
+        
+        // --- DASHBOARD VIEW ---
+        const renderDashboard = () => {
+            const projectListHtml = state.projects.length ? state.projects.map(p => `
+                <div onclick="loadProject('${p.id}')" class="bg-white p-4 rounded-xl shadow-sm border border-gray-200 active:scale-95 transition-transform cursor-pointer">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h3 class="font-bold text-lg text-slate-800">${p.name}</h3>
+                            <p class="text-sm text-slate-500">${p.clientName || 'No Client'}</p>
+                        </div>
+                        <span class="text-xs bg-blue-50 text-blue-600 border border-blue-100 px-2 py-1 rounded-full">${new Date(p.updatedAt).toLocaleDateString()}</span>
+                    </div>
+                    <div class="mt-3 flex justify-between items-end border-t pt-2">
+                        <div class="text-xs text-gray-400">STATUS: ${p.status || 'Active'}</div>
+                        <div class="font-bold text-blue-600 text-sm">Open Project &rarr;</div>
+                    </div>
+                </div>
+            `).join('') : `<div class="text-center p-10 text-gray-400 col-span-full">No projects found.<br>Create one to get started!</div>`;
+
+            return `
+                <header class="bg-white p-4 border-b flex justify-between items-center sticky top-0 z-20 shadow-sm">
+                    <h1 class="text-xl font-black text-blue-700 tracking-tight">CONTRACTOR<span class="text-slate-800">HUB</span></h1>
+                    <button onclick="showModal('newProject')" class="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold shadow-md hover:bg-blue-700 transition">+ New Project</button>
+                </header>
+                <main class="flex-1 overflow-y-auto p-4 bg-slate-50">
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        ${projectListHtml}
+                    </div>
+                </main>
+            `;
+        };
+
+        // --- PROJECT VIEW ---
+        const renderProjectView = () => {
+            if(!state.activeProject) return '';
+            
+            return `
+                <div class="flex flex-col h-full bg-slate-50">
+                    <header class="bg-white border-b shadow-sm z-20">
+                        <div class="flex items-center p-3 gap-3">
+                            <button onclick="setView('dashboard')" class="p-2 rounded-full hover:bg-slate-100 text-slate-600">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+                            </button>
+                            <div class="flex-1 overflow-hidden">
+                                <h2 class="font-bold text-lg truncate text-slate-800">${state.activeProject.name}</h2>
+                                <p class="text-xs text-slate-500 truncate">${state.activeProject.address || 'No Address'}</p>
+                            </div>
+                            <button onclick="exportProject()" class="flex items-center gap-1 text-blue-600 font-medium text-sm bg-blue-50 px-3 py-1.5 rounded-lg border border-blue-100">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                                Backup
+                            </button>
+                        </div>
+                        <div class="flex text-sm font-medium border-t">
+                            <button onclick="setTab('estimate')" class="flex-1 py-3 text-center transition-colors ${state.activeTab === 'estimate' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}">Estimate</button>
+                            <button onclick="setTab('photos')" class="flex-1 py-3 text-center transition-colors ${state.activeTab === 'photos' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}">Photos</button>
+                            <button onclick="setTab('financials')" class="flex-1 py-3 text-center transition-colors ${state.activeTab === 'financials' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-500 hover:text-gray-700'}">Billing</button>
+                        </div>
+                    </header>
+
+                    <main id="project-content" class="flex-1 overflow-y-auto">
+                        ${renderTabContent()}
+                    </main>
+                </div>
+            `;
+        };
+
+        const renderTabContent = () => {
+            switch(state.activeTab) {
+                case 'estimate': return renderEstimateTab();
+                case 'photos': return renderPhotosTab();
+                case 'financials': return renderFinancialsTab();
+                default: return '';
+            }
+        };
+
+        // --- ESTIMATE TAB (Logic from Estimate Revival) ---
+        const renderEstimateTab = () => {
+            // Group items by Phase -> Task
+            const phases = {};
+            let totalMaterials = 0;
+            let totalLabor = 0;
+
+            state.estimateItems.forEach(item => {
+                if(!phases[item.phase]) phases[item.phase] = {};
+                if(!phases[item.phase][item.task]) phases[item.phase][item.task] = [];
+                phases[item.phase][item.task].push(item);
+                
+                const cost = (parseFloat(item.quantity) || 0) * (parseFloat(item.unitCost) || 0);
+                if(item.type === 'Material') totalMaterials += cost;
+                else totalLabor += cost;
+            });
+
+            // Calculate Markups
+            const m = state.activeProject.markups || { overhead: 0, profit: 0, tax: 0 };
+            const subtotal = totalMaterials + totalLabor;
+            const overheadAmt = subtotal * (m.overhead / 100);
+            const profitAmt = (subtotal + overheadAmt) * (m.profit / 100);
+            const taxAmt = (subtotal + overheadAmt + profitAmt) * (m.tax / 100);
+            const finalTotal = subtotal + overheadAmt + profitAmt + taxAmt;
+
+            // Generate HTML for Phases
+            let phasesHtml = Object.keys(phases).map(phaseName => {
+                let tasksHtml = Object.keys(phases[phaseName]).map(taskName => {
+                    const items = phases[phaseName][taskName];
+                    const taskTotal = items.reduce((sum, i) => sum + ((i.quantity||0)*(i.unitCost||0)), 0);
+                    
+                    const itemsHtml = items.map(i => `
+                        <div class="grid grid-cols-12 gap-2 text-sm py-2 border-b border-gray-100 items-center bg-white pl-4">
+                            <div class="col-span-5 font-medium text-slate-700 truncate">${i.description || 'Item'}</div>
+                            <div class="col-span-2 text-right text-gray-500 text-xs">${i.quantity} ${i.unit}</div>
+                            <div class="col-span-2 text-right text-gray-500 text-xs">$${i.unitCost}</div>
+                            <div class="col-span-2 text-right font-semibold text-xs">${currency(i.quantity * i.unitCost)}</div>
+                            <div class="col-span-1 text-right">
+                                <button onclick="deleteItem('${i.id}')" class="text-red-400 hover:text-red-600 font-bold px-2">×</button>
+                            </div>
+                        </div>
+                    `).join('');
+
+                    return `
+                        <div class="mb-2">
+                            <div class="bg-gray-100 p-2 px-3 rounded text-sm font-semibold text-slate-700 flex justify-between items-center">
+                                <span>${taskName}</span>
+                                <span>${currency(taskTotal)}</span>
+                            </div>
+                            <div class="border-l-2 border-gray-200 ml-2">
+                                ${itemsHtml}
+                                <button onclick="showAddItemModal('${phaseName}', '${taskName}')" class="text-xs text-blue-600 font-bold py-2 pl-4 hover:underline">+ Add Item</button>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+                return `
+                    <div class="bg-white mb-4 rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+                        <div class="bg-slate-50 p-3 border-b border-gray-200 flex justify-between items-center">
+                            <h3 class="font-bold text-slate-800">${phaseName}</h3>
+                            <button onclick="showAddItemModal('${phaseName}')" class="text-xs bg-white border border-gray-300 px-2 py-1 rounded text-slate-600 hover:bg-gray-50">+ Task</button>
+                        </div>
+                        <div class="p-3">
+                            ${tasksHtml}
+                            ${Object.keys(phases[phaseName]).length === 0 ? `<button onclick="showAddItemModal('${phaseName}')" class="w-full py-4 text-sm text-gray-400 border-2 border-dashed rounded-lg hover:border-blue-300 hover:text-blue-500 transition">+ Add First Task</button>` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            return `
+                <div class="p-4 pb-24">
+                    <div class="bg-slate-800 text-white rounded-xl p-4 mb-6 shadow-lg">
+                        <div class="grid grid-cols-2 gap-4 text-sm mb-4 border-b border-slate-700 pb-4">
+                            <div>
+                                <div class="text-slate-400">Materials</div>
+                                <div class="font-mono text-lg">${currency(totalMaterials)}</div>
+                            </div>
+                            <div>
+                                <div class="text-slate-400">Labor</div>
+                                <div class="font-mono text-lg">${currency(totalLabor)}</div>
+                            </div>
+                        </div>
+                        <div class="flex justify-between items-end">
+                            <div class="text-slate-400 text-sm">Final Bid Price</div>
+                            <div class="font-bold text-3xl tracking-tight">${currency(finalTotal)}</div>
+                        </div>
+                        <div class="mt-2 text-xs text-slate-500 text-right">
+                            Includes ${m.overhead}% OH, ${m.profit}% Profit
+                        </div>
+                    </div>
+
+                    ${phasesHtml}
+                    
+                    <button onclick="showAddPhaseModal()" class="w-full py-3 bg-white border-2 border-dashed border-gray-300 rounded-xl text-gray-500 font-semibold hover:border-blue-400 hover:text-blue-600 transition mb-8">
+                        + Add New Phase
+                    </button>
+                </div>
+            `;
+        };
+
+        const renderPhotosTab = () => {
+            return `<div class="p-10 text-center text-gray-500">Photo Module coming in Phase 3</div>`;
+        };
+        
+        const renderFinancialsTab = () => {
+             return `<div class="p-10 text-center text-gray-500">Financials Module coming in Phase 3</div>`;
+        };
+
+        // ==========================================
+        // 5. APP CONTROLLER
+        // ==========================================
+        const render = () => {
+            const app = document.getElementById('app');
+            if (state.view === 'dashboard') app.innerHTML = renderDashboard();
+            else app.innerHTML = renderProjectView();
+        };
+
+        const setView = (view) => {
+            state.view = view;
+            if(view === 'dashboard') state.activeProject = null;
+            render();
+        };
+
+        const setTab = (tab) => {
+            state.activeTab = tab;
+            render();
+        };
+
+        const loadProject = async (id) => {
+            state.activeProject = await dbOp('projects', 'readonly', s => s.get(id));
+            state.estimateItems = await getProjectItems(id);
+            state.view = 'project';
+            state.activeTab = 'estimate'; // default
+            render();
+        };
+
+        const createProject = async (name) => {
+            const newProject = {
+                id: generateId(),
+                name: name,
+                clientName: '',
+                address: '',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                status: 'Estimating',
+                markups: { overhead: 10, profit: 20, tax: 0 }
+            };
+            await dbOp('projects', 'readwrite', s => s.put(newProject));
+            await loadProjects();
+        };
+
+        const loadProjects = async () => {
+            state.projects = await dbOp('projects', 'readonly', s => s.getAll());
+            render();
+        };
+
+        const addItem = async (phase, task, desc, type, qty, cost) => {
+            const newItem = {
+                id: generateId(),
+                projectId: state.activeProject.id,
+                phase: phase,
+                task: task,
+                description: desc,
+                type: type, // 'Material' or 'Labor'
+                quantity: parseFloat(qty),
+                unitCost: parseFloat(cost),
+                unit: 'ea'
+            };
+            await dbOp('estimateItems', 'readwrite', s => s.put(newItem));
+            
+            // Refresh
+            state.estimateItems = await getProjectItems(state.activeProject.id);
+            render();
+        };
+
+        const deleteItem = async (id) => {
+            if(confirm('Delete item?')) {
+                await dbOp('estimateItems', 'readwrite', s => s.delete(id));
+                state.estimateItems = await getProjectItems(state.activeProject.id);
+                render();
+            }
+        };
+
+        // ==========================================
+        // 6. MODALS
+        // ==========================================
+        const showModal = (type) => {
+            if(type === 'newProject') {
+                const name = prompt("Project Name:");
+                if(name) createProject(name);
+            }
+        };
+
+        const showAddPhaseModal = () => {
+            const name = prompt("Phase Name (e.g., Kitchen, Bathroom):");
+            if(name) {
+                const task = prompt(`First task for ${name} (e.g., Demo):`);
+                if(task) showAddItemModal(name, task);
+            }
+        };
+
+        const showAddItemModal = (phase, task) => {
+            if(!task) task = prompt(`Task Name for ${phase}:`);
+            if(!task) return;
+
+            // Simple prompts for now - can be upgraded to UI modal later
+            const desc = prompt(`Item Description for ${task}:`);
+            if(!desc) return;
+            
+            const cost = prompt("Unit Cost ($):", "0");
+            const qty = prompt("Quantity:", "1");
+            const type = confirm("Is this Material? (OK) or Labor? (Cancel)") ? "Material" : "Labor";
+
+            addItem(phase, task, desc, type, qty, cost);
+        };
+
+        // ==========================================
+        // 7. INITIALIZATION
+        // ==========================================
+        const init = async () => {
+            try {
+                await initDB();
+                await loadProjects();
+            } catch (err) {
+                console.error("Init failed", err);
+                document.getElementById('app').innerHTML = `<div class="p-10 text-red-600">Error loading database. Please refresh.</div>`;
+            }
+        };
+
+        init();
+    </script>
+</body>
+</html>
