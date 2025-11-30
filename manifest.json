@@ -1,0 +1,9 @@
+{
+  "name": "Contractor Command Center",
+  "short_name": "Estimator",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#1976d2",
+  "theme_color": "#1976d2",
+  "icons": []
+}
